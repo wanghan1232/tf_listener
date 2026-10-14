@@ -1,11 +1,19 @@
 #include <rclcpp/rclcpp.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <stdexcept>
 #include <string>
 
 #include "tf_lisense_pkg/serial_sender.hpp"
@@ -33,6 +41,16 @@ public:
         // 低通滤波系数（0~1），值越大平滑性越好，但滞后越大
         m_alpha = this->declare_parameter<double>("filter_alpha", 0.3);
         m_tag_timeout_ms = this->declare_parameter<int>("tag_timeout_ms", 500);
+        m_path_timeout_ms = this->declare_parameter<int>("path_timeout_ms", 500);
+        m_odom_timeout_ms = this->declare_parameter<int>("odom_timeout_ms", 500);
+        const auto path_topic = this->declare_parameter<std::string>(
+            "path_topic", "/local_plan_sampled");
+        if (m_path_timeout_ms <= 0 || m_odom_timeout_ms <= 0)
+        {
+            throw std::invalid_argument("path_timeout_ms and odom_timeout_ms must be positive");
+        }
+        m_tf_buffer = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
 
         connectSerialPort();
         m_reconnect_timer = this->create_wall_timer(
@@ -46,12 +64,19 @@ public:
         m_tag_sub = this->create_subscription<std_msgs::msg::Float64MultiArray>(
             "/tag_pose_compensated", 10,
             std::bind(&OdomListener::tagPoseCallback, this, std::placeholders::_1));
+        m_path_sub = this->create_subscription<nav_msgs::msg::Path>(
+            path_topic, rclcpp::QoS(1),
+            std::bind(&OdomListener::pathCallback, this, std::placeholders::_1));
+        m_path_timer = this->create_wall_timer(
+            std::chrono::milliseconds(50), std::bind(&OdomListener::expirePath, this));
 
         //   m_sub = this->create_subscription<nav_msgs::msg::Odometry>(
         //        "/fastlio2/lio_odom", 10,
         //        std::bind(&OdomListener::callback, this, std::placeholders::_1));
 
-        RCLCPP_INFO(this->get_logger(), "Subscribing to /lio/imu/odom and /tag_pose_compensated ...");
+        RCLCPP_INFO(this->get_logger(),
+            "Subscribing to /lio/imu/odom, /tag_pose_compensated and %s; serial frame: 48 bytes",
+            path_topic.c_str());
     }
 
 private:
@@ -88,6 +113,21 @@ private:
         const auto &p = msg->pose.pose.position;
         const auto &q = msg->pose.pose.orientation;
         const auto &v = msg->twist.twist.linear;
+        const double norm = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
+        if (msg->header.frame_id.empty() || !std::isfinite(p.x) || !std::isfinite(p.y) ||
+            !std::isfinite(p.z) || !std::isfinite(v.x) || !std::isfinite(v.y) ||
+            !std::isfinite(v.z) || !std::isfinite(norm) || norm < 1e-9)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Ignoring invalid odometry or empty odometry frame");
+            return;
+        }
+        if (m_odom_frame != msg->header.frame_id)
+        {
+            m_path_count = 0;
+            m_first_received = false;
+            m_odom_frame = msg->header.frame_id;
+        }
         
         // 四元数 -> 偏航角（绕 Z 轴，弧度）
         const double yaw = quaternionToYaw(q.w, q.x, q.y, q.z);
@@ -122,36 +162,138 @@ private:
             m_filtered_x, m_filtered_y, m_filtered_z, m_filtered_yaw * 180.0 / kPi);
             printIndex_ = 0;
         }
-        const bool tagIsFresh = m_has_tag &&
-            (this->now() - m_last_tag_time).nanoseconds() <=
-            static_cast<int64_t>(m_tag_timeout_ms) * 1000000;
+        m_odom_words = {
+            toMmInt16(m_filtered_x), toMmInt16(m_filtered_y),
+            toMmInt16(m_filtered_z), toMradInt16(m_filtered_yaw),
+            toMmPerSecondInt16(v.x), toMmPerSecondInt16(v.y), toMmPerSecondInt16(v.z)};
+        m_last_odom_time = std::chrono::steady_clock::now();
+        sendCombinedFrame();
+        printIndex_++;
+    }
 
-        const int16_t tag_id = tagIsFresh ? m_tag_id : -1;
-        const int16_t tag_x = tagIsFresh ? toMmInt16(m_tag_x) : 0;
-        const int16_t tag_y = tagIsFresh ? toMmInt16(m_tag_y) : 0;
-        const int16_t tag_z = tagIsFresh ? toMmInt16(m_tag_z) : 0;
-        const int16_t tag_yaw = tagIsFresh ? toCentidegInt16(m_tag_yaw_deg) : 0;
-
-        // 组合帧：里程计 [x, y, z, yaw, vx, vy, vz] + AprilTag [id, x, y, z, yaw]
-        // 帧格式：0xAA | 12 个 INT16S 大端字 | 0xBB
-        // 里程计位置单位 mm、yaw 单位毫弧度、速度单位 mm/s；
-        // Tag 位置单位 mm、yaw 单位 0.01 度。
-        // Tag 数据超时未更新时，后 5 个字发送 [-1, 0, 0, 0, 0]。
-        if (!serial_comm::sendFrameInt16(m_serial,
-                toMmInt16(m_filtered_x), toMmInt16(m_filtered_y),
-                toMmInt16(m_filtered_z), toMradInt16(m_filtered_yaw),
-                toMmPerSecondInt16(v.x), toMmPerSecondInt16(v.y),
-                toMmPerSecondInt16(v.z),
-                tag_id, tag_x, tag_y, tag_z, tag_yaw
-                ))
-        
+    void sendCombinedFrame()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_first_received || now - m_last_odom_time >
+            std::chrono::milliseconds(m_odom_timeout_ms))
+        {
+            return;  // Do not repeatedly send a stale robot position on path updates.
+        }
+        if (now - m_last_path_time > std::chrono::milliseconds(m_path_timeout_ms))
+        {
+            m_path_count = 0;
+        }
+        // 0xAA | odom[7] | N | path[5][x,y,yaw] | 0xBB
+        // 23 个 int16，大端，共 48 字节。位置 mm，yaw 毫弧度，速度 mm/s。
+        // N=0 表示无有效路径；未使用的路径槽全部填零。
+        std::array<int16_t, 23> words{};
+        std::copy(m_odom_words.begin(), m_odom_words.end(), words.begin());
+        words[7] = m_path_count;
+        std::copy_n(m_path_words.begin(), static_cast<std::size_t>(m_path_count) * 3,
+            words.begin() + 8);
+        if (!serial_comm::sendFrameInt16Array(m_serial, words.data(), words.size()))
         {
             m_serial.close();
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
                 "Serial write failed; closed the port and will retry connection every %d ms.",
                 m_reconnect_interval_ms);
         }
-        printIndex_++;
+    }
+
+    void expirePath()
+    {
+        if (m_path_count > 0 && std::chrono::steady_clock::now() - m_last_path_time >
+            std::chrono::milliseconds(m_path_timeout_ms))
+        {
+            m_path_count = 0;
+            sendCombinedFrame();
+        }
+    }
+
+    void pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
+    {
+        // Clear first so an invalid update never leaves the previous path active.
+        m_path_count = 0;
+        m_path_words.fill(0);
+        if (msg->poses.empty())
+        {
+            sendCombinedFrame();
+            return;
+        }
+        if (!m_first_received || msg->header.frame_id.empty() || msg->poses.size() > 5)
+        {
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "Path rejected: need odometry first, a frame and at most 5 points");
+            sendCombinedFrame();
+            return;
+        }
+
+        geometry_msgs::msg::TransformStamped transform;
+        const bool needs_transform = msg->header.frame_id != m_odom_frame;
+        if (needs_transform)
+        {
+            try
+            {
+                // A zero stamp means latest TF; otherwise use the path publication time.
+                transform = m_tf_buffer->lookupTransform(m_odom_frame, msg->header.frame_id,
+                    rclcpp::Time(msg->header.stamp, this->get_clock()->get_clock_type()));
+            }
+            catch (const tf2::TransformException &ex)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Cannot transform path to odometry frame: %s", ex.what());
+                sendCombinedFrame();
+                return;
+            }
+        }
+
+        std::array<int16_t, 15> path_words{};
+        for (std::size_t i = 0; i < msg->poses.size(); ++i)
+        {
+            auto pose = msg->poses[i];
+            auto &q = pose.pose.orientation;
+            const double norm = std::hypot(std::hypot(q.x, q.y), std::hypot(q.z, q.w));
+            if ((!pose.header.frame_id.empty() && pose.header.frame_id != msg->header.frame_id) ||
+                !std::isfinite(pose.pose.position.x) || !std::isfinite(pose.pose.position.y) ||
+                !std::isfinite(pose.pose.position.z) || !std::isfinite(norm) || norm < 1e-9)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Path rejected: invalid coordinates, quaternion or point frame");
+                sendCombinedFrame();
+                return;
+            }
+            q.x /= norm;
+            q.y /= norm;
+            q.z /= norm;
+            q.w /= norm;
+            if (needs_transform)
+            {
+                geometry_msgs::msg::PoseStamped converted;
+                tf2::doTransform(pose, converted, transform);
+                pose = converted;
+            }
+            const double x = pose.pose.position.x;
+            const double y = pose.pose.position.y;
+            const auto &orientation = pose.pose.orientation;
+            const double yaw = quaternionToYaw(
+                orientation.w, orientation.x, orientation.y, orientation.z);
+            // Unlike telemetry, never silently clip a path into a different route.
+            if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(yaw) ||
+                x < -32.768 || x > 32.767 || y < -32.768 || y > 32.767)
+            {
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                    "Path rejected: point outside int16 millimetre range");
+                sendCombinedFrame();
+                return;
+            }
+            path_words[i * 3] = toMmInt16(x);
+            path_words[i * 3 + 1] = toMmInt16(y);
+            path_words[i * 3 + 2] = toMradInt16(yaw);
+        }
+        m_path_words = path_words;
+        m_path_count = static_cast<int16_t>(msg->poses.size());
+        m_last_path_time = std::chrono::steady_clock::now();
+        sendCombinedFrame();  // Send every received path update immediately.
     }
 
     void tagPoseCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
@@ -238,6 +380,18 @@ private:
     }
 
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr m_sub;
+    rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr m_path_sub;
+    rclcpp::TimerBase::SharedPtr m_path_timer;
+    std::unique_ptr<tf2_ros::Buffer> m_tf_buffer;
+    std::shared_ptr<tf2_ros::TransformListener> m_tf_listener;
+    std::string m_odom_frame;
+    std::array<int16_t, 7> m_odom_words{};
+    std::array<int16_t, 15> m_path_words{};
+    int16_t m_path_count = 0;
+    int m_path_timeout_ms = 500;
+    int m_odom_timeout_ms = 500;
+    std::chrono::steady_clock::time_point m_last_path_time{};
+    std::chrono::steady_clock::time_point m_last_odom_time{};
     rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr m_tag_sub;
     rclcpp::TimerBase::SharedPtr m_reconnect_timer;
     serial_comm::SerialPort m_serial;
