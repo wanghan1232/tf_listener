@@ -198,6 +198,26 @@ private:
                 "Serial write failed; closed the port and will retry connection every %d ms.",
                 m_reconnect_interval_ms);
         }
+        else if (m_path_log_pending || m_last_printed_path_count != words[7])
+        {
+            // Log new path updates once, rather than on every odometry frame.
+            // A successful write means bytes were accepted locally, not acknowledged by the MCU.
+            RCLCPP_INFO(this->get_logger(),
+                "Serial path written: frame=%s, N=%d%s",
+                m_odom_frame.c_str(), static_cast<int>(words[7]),
+                words[7] == 0 ? " (clear previous path)" : "");
+            for (int i = 0; i < words[7]; ++i)
+            {
+                const auto offset = static_cast<std::size_t>(8 + i * 3);
+                RCLCPP_INFO(this->get_logger(),
+                    "  P%d: x=%.3f m, y=%.3f m, yaw=%.3f rad (%.2f deg)",
+                    i + 1, words[offset] * 0.001, words[offset + 1] * 0.001,
+                    words[offset + 2] * 0.001,
+                    words[offset + 2] * 0.001 * 180.0 / kPi);
+            }
+            m_path_log_pending = false;
+            m_last_printed_path_count = words[7];
+        }
     }
 
     void expirePath()
@@ -293,6 +313,7 @@ private:
         m_path_words = path_words;
         m_path_count = static_cast<int16_t>(msg->poses.size());
         m_last_path_time = std::chrono::steady_clock::now();
+        m_path_log_pending = true;
         sendCombinedFrame();  // Send every received path update immediately.
     }
 
@@ -388,6 +409,8 @@ private:
     std::array<int16_t, 7> m_odom_words{};
     std::array<int16_t, 15> m_path_words{};
     int16_t m_path_count = 0;
+    bool m_path_log_pending = false;
+    int16_t m_last_printed_path_count = -1;
     int m_path_timeout_ms = 500;
     int m_odom_timeout_ms = 500;
     std::chrono::steady_clock::time_point m_last_path_time{};
